@@ -47,25 +47,163 @@ AgentProof 的核心不是单一评分模型，而是一套 **Trust Oracle 基�
 - 计算负担从请求时转移到后台任务
 - 但会有“刷新周期”带来的时延
 
-### 3.2.2 当前核心评分信号（indexer主路径）
+### 3.2.2 当前核心评分信号（indexer主路径，详细）
 
-主路径为 6 信号加权：
+本节基于 `indexer/scoring.py` 与 `indexer/indexer.py` 的实现。  
+评分流程可拆成四步：**取数 -> 预处理 -> 信号归一化 -> 加权合成**。
 
-1. 平均评分（贝叶斯平滑）
-2. 反馈量（log）
-3. 评分一致性（标准差反向）
-4. 验证成功率
-5. 账户年龄（log）
-6. 在线率（uptime）
+#### 第一步：原始数据从哪里来
 
-并引入 **verified feedback 权重**（ERC-8183 Job 锚定）：
+1. **评分数据（rating）**  
+   来源：`reputation_events.rating`  
+   衍生字段：
+   - `feedback_count = len(ratings)`
+   - `average_rating = sum(ratings)/feedback_count`
+   - `rating_std_dev = std(ratings)`
 
-- verified = 1.0
-- unverified = 0.5
+2. **verified 反馈计数**  
+   来源：`reputation_events.verified`（布尔）  
+   - `verified_feedback_count = count(verified is True)`
+   - 未标记/False 视为 unverified
 
-这对抗“无凭证刷分”非常关键。
+3. **验证数据（validation）**  
+   来源：`validation_records.is_valid`（过滤 null）  
+   - `completed = len(validation_records)`
+   - `successful = count(is_valid=True)`
+   - `validation_success_rate = successful/completed*100`（无数据时为 0，后续转中性分）
 
-### 3.2.3 分层（Tier）
+4. **账户年龄（age）**  
+   来源：`agents.registered_at`  
+   - 计算 `account_age_days = now - registered_at`
+
+5. **在线率（uptime）**  
+   来源：`uptime_daily_summary`  
+   - 汇总最近窗口内成功/总检查，得到 `uptime_pct`（0~100）
+   - 若无 uptime 数据则记为缺失
+
+#### 第二步：verified feedback 如何进入计分
+
+先把反馈数量从“原始条数”变成“有效条数（effective_count）”：
+
+- `verified` 权重 = 1.0
+- `unverified` 权重 = 0.5
+
+公式：
+
+`effective_count = verified_count + 0.5 * unverified_count`
+
+这一步的作用是：**不是把 unverified 丢掉，而是降低其影响力**，减少刷分对模型收敛速度的影响。
+
+#### 第三步：6 个信号的计算方式
+
+下列分数最终都归一到 0~100：
+
+1. **平均评分信号（rating_score，贝叶斯平滑）**
+
+- 先验：`prior = 50`
+- 伪样本：`k = 3`
+
+`rating_score = (average_rating * effective_count + prior * k) / (effective_count + k)`
+
+解释：样本少时更接近 50，样本多时更接近真实均值。
+
+2. **反馈量信号（volume_score，对数）**
+
+`volume_score = min(100, log10(effective_count + 1) / log10(101) * 100)`
+
+解释：反馈越多越可信，但边际收益递减（防止单纯堆量）。
+
+3. **一致性信号（consistency_score）**
+
+- 若 `feedback_count < 2`，直接给中性值 50
+- 否则：
+
+`consistency_score = max(0, 100 * (1 - rating_std_dev / 50))`
+
+解释：波动越大，一致性越差。
+
+4. **验证成功率信号（validation_score）**
+
+- 若有验证记录：`validation_score = validation_success_rate`
+- 若无验证记录：给中性值 50（不因缺失而惩罚）
+
+5. **账户年龄信号（age_score，对数）**
+
+`age_score = min(100, log10(account_age_days + 1) / log10(366) * 100)`
+
+解释：账户越成熟分越高，但同样是对数增长，避免“年龄碾压”。
+
+6. **在线率信号（uptime_score）**
+
+- 若有数据：`uptime_score = uptime_pct`
+- 若无数据：给中性值 50
+
+#### 第四步：加权合成最终分数
+
+当前实现权重：
+
+- rating_score: 35%
+- volume_score: 12%
+- consistency_score: 13%
+- validation_score: 18%
+- age_score: 7%
+- uptime_score: 15%
+
+合成公式：
+
+`composite = rating*0.35 + volume*0.12 + consistency*0.13 + validation*0.18 + age*0.07 + uptime*0.15`
+
+最后处理：
+
+- 截断到 `[0, 100]`
+- 四舍五入到小数点后 2 位
+
+---
+
+### 3.2.3 什么是 verified feedback？ERC-8183 起什么作用？
+
+#### 3.2.3.1 verified feedback 的定义
+
+`verified feedback` 指：这条评分被证明锚定到一个**真实发生且已完成的链上工作**，而不是任意主观打分。
+
+在 AgentProof 中，评分提交可携带 `job_id`；系统会去链上验证该 job 的完成事件是否存在。验证通过则该反馈记为 `verified=true`。
+
+#### 3.2.3.2 ERC-8183 在这里的角色（核心）
+
+AgentProof 使用 `AgentProofHook` 记录 `JobOutcomeRecorded(agentId, jobId, completed)` 事件。  
+Oracle 在接收评分时会做校验：
+
+1. 根据 `hook_chain + job_id + agent_id` 查询 Hook 事件日志
+2. 必须存在 `completed=true` 的匹配事件
+3. 通过后才能标记 `verified=true`（否则拒绝或记 unverified，取决于配置）
+
+这就是 ERC-8183 的关键价值：把“评分”从**口碑声明**变成**服务完成证明**。
+
+#### 3.2.3.3 对最终得分有什么实际影响
+
+verified 并不直接改变 `average_rating`，而是影响 `effective_count`，从而影响两件事：
+
+1. 贝叶斯平滑收敛速度（`rating_score`）
+2. 反馈量信号（`volume_score`）
+
+直观例子（同样 10 条反馈）：
+
+- 场景 A：10 条都 verified -> `effective_count = 10`
+- 场景 B：10 条都 unverified -> `effective_count = 5`
+
+在场景 B 下，模型会更“保守”，更靠近先验 50，volume 也更低，抗刷分能力更强。
+
+#### 3.2.3.4 风控附加收益
+
+除加权外，Job 锚定还带来：
+
+- **反女巫**：刷评分需要先真实完成 job，成本上升
+- **可追溯**：每条 verified 反馈可回查链上事件
+- **可配置强约束**：`feedback_require_job_id=true` 时可强制只收 job 锚定评分
+
+这使“信誉”从软信号升级为具备证据链的硬信号。
+
+### 3.2.4 分层（Tier）
 
 当前阈值：
 
