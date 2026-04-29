@@ -81,6 +81,65 @@ AgentProof 的核心不是单一评分模型，而是一套 **Trust Oracle 基�
    - 汇总最近窗口内成功/总检查，得到 `uptime_pct`（0~100）
    - 若无 uptime 数据则记为缺失
 
+#### 3.2.2.A 字段字典（重构必备）
+
+下面把“参与打分的字段”逐个展开，包含：**字段含义、来源、取值范围、缺失处理、在公式中的用途**。
+
+| 变量名 | 含义 | 来源（表.列） | 取值/类型 | 缺失与边界处理 | 用途 |
+|---|---|---|---|---|---|
+| `agent_id` | Agent主键（ERC-8004 tokenId） | `agents.agent_id` | int | 必须存在；不存在则不评分 | 所有查询的过滤键 |
+| `registered_at` | Agent注册时间 | `agents.registered_at` | ISO datetime | 解析失败会抛错；正常应为UTC时间戳 | 计算`account_age_days` |
+| `canonical` | 用于年龄计算的“主记录” | `agents`同一`agent_id`的多行 | row | 取`registered_at`最早那条（跨链最早） | 防止跨链重复注册导致年龄偏小 |
+| `ratings` | 所有评分值集合 | `reputation_events.rating`（按`agent_id`） | list[int] | 查询异常时退化为`[]` | 算均值、标准差、反馈量 |
+| `feedback_count` | 原始反馈条数 | `len(ratings)` | int >= 0 | 空列表=0 | 参与tier判定、一致性分支 |
+| `average_rating` | 原始平均评分 | `sum(ratings)/len(ratings)` | float 0~100 | 无评分时=0 | 进入贝叶斯平滑 |
+| `rating_std_dev` | 评分标准差 | `calculate_std_dev(ratings)` | float >=0 | `<2`条时直接返回0 | 一致性信号输入 |
+| `verified_feedback_count` | 已验证反馈数 | `reputation_events.verified` | int >=0 | 仅`verified is True`计数；缺列/异常时退化0 | 计算`effective_count` |
+| `completed` | 有效验证记录数 | `validation_records.is_valid`（过滤null） | int >=0 | 查询异常时=0 | 验证成功率分母 |
+| `successful` | 验证成功记录数 | 同上（`is_valid=True`） | int >=0 | 查询异常时=0 | 验证成功率分子 |
+| `validation_success_rate` | 验证成功率 | `successful/completed*100` | float 0~100 | `completed=0`时先置0，后转中性50 | `validation_score` |
+| `total_checks` | 可用性检查总次数（窗口） | `uptime_daily_summary.total_checks`（最近30条） | int >=0 | 没有记录则保持缺失态 | `uptime_pct`分母 |
+| `successful_checks` | 成功检查次数（窗口） | `uptime_daily_summary.successful_checks` | int >=0 | 没有记录则保持缺失态 | `uptime_pct`分子 |
+| `uptime_pct` | 在线率百分比 | `successful_checks/total_checks*100` | float 0~100 或 -1 | 无数据时=-1（哨兵值） | `uptime_score`输入 |
+| `old_score` | 旧分数（用于趋势/快照） | `agents.composite_score` | float 0~100 | 缺失默认0 | 判断是否写`score_history` |
+| `chains_present` | 当前agent出现在几条链 | 同`agent_id`在`agents`行数 | int >=1 | 至少1 | 写回`agents.chains_active` |
+
+补充：实现里使用 `reputation_events.select("rating, verified")`。如果数据库还没升级到含`verified`字段的版本，可能导致该查询异常并触发退化分支。生产重构时建议先确保迁移完成。
+
+#### 3.2.2.B 字段到变量的“最小重构流程”（伪代码）
+
+```python
+agent_rows = query agents where agent_id=?
+canonical = row with min(registered_at)
+
+rows = query reputation_events(rating, verified) where agent_id=?
+ratings = [row.rating]
+verified_count = count(row.verified is True)
+
+feedback_count = len(ratings)
+average_rating = mean(ratings) if ratings else 0
+rating_std_dev = std(ratings) if len(ratings)>=2 else 0
+
+validations = query validation_records(is_valid != null) where agent_id=?
+completed = len(validations)
+successful = count(is_valid is True)
+validation_success_rate = successful/completed*100 if completed>0 else 0
+
+age_days = now_utc - parse(canonical.registered_at)
+
+uptime_rows = query uptime_daily_summary(total_checks, successful_checks) where agent_id=? order by summary_date desc limit 30
+if uptime_rows and sum(total_checks)>0:
+    uptime_pct = sum(successful_checks)/sum(total_checks)*100
+else:
+    uptime_pct = -1
+
+composite = calculate_composite_score(
+  average_rating, feedback_count, rating_std_dev,
+  validation_success_rate, age_days, uptime_pct, verified_count
+)
+tier = determine_tier(composite, feedback_count)
+```
+
 #### 第二步：verified feedback 如何进入计分
 
 先把反馈数量从“原始条数”变成“有效条数（effective_count）”：
@@ -178,6 +237,36 @@ Oracle 在接收评分时会做校验：
 3. 通过后才能标记 `verified=true`（否则拒绝或记 unverified，取决于配置）
 
 这就是 ERC-8183 的关键价值：把“评分”从**口碑声明**变成**服务完成证明**。
+
+#### 3.2.3.2.A 验证链路中的字段字典（逐字段）
+
+为方便重构，这里把“提交评分 -> 校验 -> 入库”的关键字段逐条列出：
+
+| 字段 | 位置 | 含义 | 校验/规则 |
+|---|---|---|---|
+| `agent_id` | `POST /api/v1/feedback` body | 被评分的agent | 必填；数据库必须存在该agent |
+| `rating` | body | 评分值 | 1~100 |
+| `job_id` | body | ERC-8183作业ID | 可选；若开启强制模式则必填 |
+| `chain` | body | 交互发生链 | 默认`base`；用于推断`hook_chain` |
+| `hook_chain` | body | Hook事件所在链 | 默认回退到`chain` |
+| `verified` | `reputation_events.verified` | 是否通过链上作业校验 | 仅当`job_id`可被链上证明且`completed=true`时为True |
+| `hook_address` | `reputation_events.hook_address` | 使用的Hook合约地址 | 从配置`agentproof_hook_{chain}`解析 |
+| `job_id` + `hook_chain` | `reputation_events` | 作业锚点联合键 | 同一作业仅允许一次评分（防重复） |
+| `reviewer_address` | `reputation_events.reviewer_address` | 评分主体标识 | 由`api_key_id`哈希生成的伪地址 |
+| `task_hash` | `reputation_events.task_hash` | 去重/关联任务 | 客户端不传则服务端自动生成 |
+| `tx_hash` | `reputation_events.tx_hash` | API写入的伪交易哈希 | 服务端生成，用于审计追踪 |
+
+链上验证使用的事件与topic过滤：
+
+- 事件签名：`JobOutcomeRecorded(uint256 agentId, uint256 jobId, bool completed)`
+- 过滤条件：`topic0=事件签名`、`topic1=agent_id`、`topic2=job_id`
+- 必须命中最新日志且 `completed == true`
+
+配置项（重构必须保留）：
+
+- `agentproof_hook_{chain}`：每条链的Hook地址
+- `hook_event_scan_blocks`：回扫区块窗口
+- `feedback_require_job_id`：是否强制所有评分必须job锚定
 
 #### 3.2.3.3 对最终得分有什么实际影响
 
